@@ -1,0 +1,85 @@
+---
+- name: Wait for SSH to become available
+  ansible.builtin.wait_for_connection:
+    delay: 5
+    timeout: 240
+
+- name: Refresh apt cache (with retries on freshly-booted VMs)
+  ansible.builtin.apt:
+    update_cache: true
+  retries: 3
+  delay: 10
+  register: apt_refresh
+  until: apt_refresh is success
+
+- name: Install runtime dependencies
+  ansible.builtin.apt:
+    name:
+      - python3-pip
+      - python3-flask
+      - snmpd
+      - snmp
+    state: present
+  retries: 3
+  delay: 10
+  register: pkg_install
+  until: pkg_install is success
+
+- name: Drop service.py onto the node
+  ansible.builtin.copy:
+    src: ../../../service.py
+    dest: /opt/service.py
+    mode: "0755"
+  register: app_deployed
+
+- name: Install systemd unit for service.py
+  ansible.builtin.template:
+    src: service.service.j2
+    dest: /etc/systemd/system/service.service
+    mode: "0644"
+  register: unit_deployed
+
+- name: Reload systemd if unit changed
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: unit_deployed.changed
+
+- name: Restart service.py if anything changed
+  ansible.builtin.systemd:
+    name: service
+    state: restarted
+    enabled: true
+  when: app_deployed.changed or unit_deployed.changed
+
+- name: Ensure service.py is running
+  ansible.builtin.systemd:
+    name: service
+    state: started
+    enabled: true
+
+- name: Configure snmpd to listen on UDP {{ snmp_port }}
+  ansible.builtin.template:
+    src: snmpd.conf.j2
+    dest: /etc/snmp/snmpd.conf
+    mode: "0644"
+  register: snmpd_conf
+
+- name: Restart snmpd if configuration changed
+  ansible.builtin.systemd:
+    name: snmpd
+    state: restarted
+    enabled: true
+  when: snmpd_conf.changed
+
+- name: Ensure snmpd is running
+  ansible.builtin.systemd:
+    name: snmpd
+    state: started
+    enabled: true
+
+- name: Confirm service.py port is open
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ service_port }}"
+    delay: 2
+    timeout: 30

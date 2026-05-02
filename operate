@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# operate <openrc> <tag> <ssh_key>
+#
+# Stage 2 of the NSO project lifecycle: continuously reconcile the live cloud
+# state against servers.conf until interrupted with Ctrl-C.
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# macOS Ansible workaround for High Sierra+ fork() restrictions.
+export OBJC_DISABLE_INITIALIZE_FORK_SAFETY="${OBJC_DISABLE_INITIALIZE_FORK_SAFETY:-YES}"
+if [[ -d "$HERE/venv" ]]; then
+    # shellcheck disable=SC1091
+    source "$HERE/venv/bin/activate"
+fi
+exec python3 "$HERE/operate.py" "$@"

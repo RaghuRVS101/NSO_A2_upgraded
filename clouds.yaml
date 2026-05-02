@@ -1,0 +1,28 @@
+## OpenStack credentials for the BTH NPLab cloud.
+##
+## TWO things you must do before running install/operate/cleanup:
+##
+##   1. Replace Raghu@1005 below with your Horizon password
+##      (or delete the whole 'password:' line and instead
+##       export OS_PASSWORD='your-password' in your shell).
+##   2. If you hit SSL verification errors, uncomment the
+##      `verify: false` line under the cloud entry.
+##
+## This file is read directly by ./install / ./operate / ./cleanup
+## (path passed as the first argument). nso.py auto-detects the YAML
+## format and routes through openstacksdk.
+##
+clouds:
+  openstack:
+    auth:
+      auth_url: https://horizon.nplab.bth.se:5000/v3
+      username: "RaghuvamsiSai"
+      password: "Raghu@1005"
+      project_id: 2c08c05f33744697b05d6adc1f216997
+      project_name: "RaghuvamsiSai-project"
+      user_domain_name: "Default"
+    region_name: "RegionOne"
+    interface: "public"
+    identity_api_version: 3
+    # Uncomment if the lab cert is self-signed and you get SSL errors:
+    # verify: false

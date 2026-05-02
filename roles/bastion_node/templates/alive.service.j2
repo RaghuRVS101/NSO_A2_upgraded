@@ -1,0 +1,16 @@
+[Unit]
+Description=Bastion node-availability checker (alive.py)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt
+Environment=FLASK_APP=alive.py
+ExecStart=/usr/bin/python3 -m flask run --host=0.0.0.0 --port={{ alive_port }}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

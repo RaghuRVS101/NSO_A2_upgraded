@@ -1,0 +1,65 @@
+---
+- name: Wait for SSH to become available
+  ansible.builtin.wait_for_connection:
+    delay: 5
+    timeout: 240
+
+- name: Refresh apt cache
+  ansible.builtin.apt:
+    update_cache: true
+  retries: 3
+  delay: 10
+  register: apt_refresh
+  until: apt_refresh is success
+
+- name: Install HAProxy and NGINX
+  ansible.builtin.apt:
+    name:
+      - haproxy
+      - nginx
+    state: present
+  retries: 3
+  delay: 10
+
+- name: Enable HAProxy in /etc/default/haproxy (Debian package quirk)
+  ansible.builtin.lineinfile:
+    path: /etc/default/haproxy
+    regexp: "^ENABLED="
+    line: "ENABLED=1"
+    create: true
+
+- name: Render HAProxy config (TCP {{ service_port }})
+  ansible.builtin.template:
+    src: haproxy.cfg.j2
+    dest: /etc/haproxy/haproxy.cfg
+    mode: "0644"
+  notify: restart haproxy
+
+- name: Render NGINX stream config (UDP {{ snmp_port }})
+  ansible.builtin.template:
+    src: nginx-stream.conf.j2
+    dest: /etc/nginx/nginx.conf
+    mode: "0644"
+  notify: restart nginx
+
+- name: Ensure HAProxy is enabled and running
+  ansible.builtin.systemd:
+    name: haproxy
+    state: started
+    enabled: true
+
+- name: Ensure NGINX is enabled and running
+  ansible.builtin.systemd:
+    name: nginx
+    state: started
+    enabled: true
+
+- name: Flush handlers so the proxy is reloaded before the smoke test
+  ansible.builtin.meta: flush_handlers
+
+- name: Confirm HAProxy is listening on TCP {{ service_port }}
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ service_port }}"
+    delay: 2
+    timeout: 30

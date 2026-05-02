@@ -1,0 +1,45 @@
+---
+- name: Configure service nodes (service.py + snmpd)
+  hosts: nodes
+  become: true
+  gather_facts: true
+  roles:
+    - service_node
+
+- name: Configure bastion (alive.py node-availability checker)
+  hosts: bastion
+  become: true
+  gather_facts: true
+  roles:
+    - bastion_node
+
+- name: Configure proxy (HAProxy TCP service port + NGINX UDP SNMP port)
+  hosts: proxy
+  become: true
+  gather_facts: true
+  roles:
+    - proxy_node
+
+- name: Smoke test through the proxy
+  hosts: proxy
+  become: false
+  gather_facts: false
+  tasks:
+    - name: Wait for HAProxy health checks to settle
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Hit the load balancer N times
+      ansible.builtin.uri:
+        url: "http://127.0.0.1:{{ service_port }}/"
+        return_content: true
+        status_code: 200
+      register: probe
+      loop: "{{ range(1, (groups['nodes'] | length) * 2 + 1) | list }}"
+
+    - name: Show responses
+      ansible.builtin.debug:
+        msg: "Request{{ idx + 1 }}: {{ item.content | trim }}"
+      loop: "{{ probe.results }}"
+      loop_control:
+        index_var: idx

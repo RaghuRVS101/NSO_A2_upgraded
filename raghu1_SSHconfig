@@ -1,0 +1,28 @@
+Host *
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR
+    ServerAliveInterval 30
+
+Host raghu1_bastion bastion
+    HostName 194.47.155.140
+    User ubuntu
+    IdentityFile /Users/aniket.agarwalla/.ssh/nso_id
+
+Host raghu1_proxy
+    HostName 10.10.20.235
+    User ubuntu
+    IdentityFile /Users/aniket.agarwalla/.ssh/nso_id
+    ProxyJump raghu1_bastion
+
+Host raghu1_node_2
+    HostName 10.10.20.228
+    User ubuntu
+    IdentityFile /Users/aniket.agarwalla/.ssh/nso_id
+    ProxyJump raghu1_bastion
+
+Host raghu1_node_1
+    HostName 10.10.20.252
+    User ubuntu
+    IdentityFile /Users/aniket.agarwalla/.ssh/nso_id
+    ProxyJump raghu1_bastion

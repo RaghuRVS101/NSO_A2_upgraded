@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# install <openrc> <tag> <ssh_key>
+#
+# Stage 1 of the NSO project lifecycle: provision (or reconcile) every cloud
+# resource needed for the deployment, then run Ansible to configure each VM.
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# macOS Ansible workaround for High Sierra+ fork() restrictions.
+export OBJC_DISABLE_INITIALIZE_FORK_SAFETY="${OBJC_DISABLE_INITIALIZE_FORK_SAFETY:-YES}"
+if [[ -d "$HERE/venv" ]]; then
+    # shellcheck disable=SC1091
+    source "$HERE/venv/bin/activate"
+fi
+exec python3 "$HERE/install.py" "$@"

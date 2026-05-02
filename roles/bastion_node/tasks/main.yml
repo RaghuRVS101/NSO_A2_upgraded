@@ -1,0 +1,76 @@
+---
+- name: Wait for SSH to become available
+  ansible.builtin.wait_for_connection:
+    delay: 5
+    timeout: 240
+
+- name: Refresh apt cache
+  ansible.builtin.apt:
+    update_cache: true
+  retries: 3
+  delay: 10
+  register: apt_refresh
+  until: apt_refresh is success
+
+- name: Install runtime dependencies for alive.py
+  ansible.builtin.apt:
+    name:
+      - python3-pip
+      - python3-flask
+      - iputils-ping
+    state: present
+  retries: 3
+  delay: 10
+
+- name: Install ping3 (used by alive.py to ICMP-ping each node)
+  ansible.builtin.pip:
+    name: ping3
+    state: present
+    extra_args: --break-system-packages
+  ignore_errors: true
+
+- name: Drop alive.py onto the bastion
+  ansible.builtin.copy:
+    src: ../../../alive.py
+    dest: /opt/alive.py
+    mode: "0755"
+  register: app_deployed
+
+- name: Render nodes.yaml with the current set of service nodes
+  ansible.builtin.template:
+    src: nodes.yaml.j2
+    dest: /opt/nodes.yaml
+    mode: "0644"
+  register: nodes_changed
+
+- name: Install systemd unit for alive.py
+  ansible.builtin.template:
+    src: alive.service.j2
+    dest: /etc/systemd/system/alive.service
+    mode: "0644"
+  register: unit_deployed
+
+- name: Reload systemd if unit changed
+  ansible.builtin.systemd:
+    daemon_reload: true
+  when: unit_deployed.changed
+
+- name: Restart alive.py if anything changed
+  ansible.builtin.systemd:
+    name: alive
+    state: restarted
+    enabled: true
+  when: app_deployed.changed or unit_deployed.changed or nodes_changed.changed
+
+- name: Ensure alive.py is running
+  ansible.builtin.systemd:
+    name: alive
+    state: started
+    enabled: true
+
+- name: Confirm alive.py port is open
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ alive_port }}"
+    delay: 2
+    timeout: 30

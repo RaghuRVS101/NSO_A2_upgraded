@@ -1,0 +1,25 @@
+global
+    log /dev/log local0
+    log /dev/log local1 notice
+    daemon
+    maxconn 4096
+
+defaults
+    log     global
+    mode    tcp
+    option  tcplog
+    option  dontlognull
+    retries 3
+    timeout connect 5s
+    timeout client  60s
+    timeout server  60s
+
+frontend service_in
+    bind *:{{ service_port }}
+    default_backend service_pool
+
+backend service_pool
+    balance roundrobin
+{% for host in groups['nodes'] %}
+    server {{ host }} {{ hostvars[host]['ansible_host'] }}:{{ service_port }} check
+{% endfor %}

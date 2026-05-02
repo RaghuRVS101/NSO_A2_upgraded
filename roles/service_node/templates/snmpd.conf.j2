@@ -1,0 +1,16 @@
+## Managed by Ansible — do not edit by hand.
+
+# Listen on UDP {{ snmp_port }} on every interface so the proxy can reach us.
+agentAddress udp:0.0.0.0:{{ snmp_port }}
+
+# Read-only "public" community, restricted to the systemonly view.
+rocommunity public default -V systemonly
+
+# Identification metadata.
+sysLocation  "{{ deploy_tag }} cloud deployment"
+sysContact   "admin@example.com"
+sysServices  72
+
+# Standard MIB views (default snmpd ships with these; redeclared explicitly).
+view systemonly  included   .1.3.6.1.2.1.1
+view systemonly  included   .1.3.6.1.2.1.25.1

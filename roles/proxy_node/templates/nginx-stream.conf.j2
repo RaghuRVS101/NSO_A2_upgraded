@@ -1,0 +1,31 @@
+user www-data;
+worker_processes auto;
+pid /run/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+# UDP load balancing for snmpd lives in the stream module.
+stream {
+    upstream snmp_pool {
+{% for host in groups['nodes'] %}
+        server {{ hostvars[host]['ansible_host'] }}:{{ snmp_port }};
+{% endfor %}
+    }
+
+    server {
+        listen {{ snmp_port }} udp;
+        proxy_pass snmp_pool;
+        proxy_responses 1;
+        proxy_timeout 10s;
+    }
+}
+
+# Minimal HTTP block to keep nginx happy (we don't actually serve HTTP here).
+http {
+    server {
+        listen 127.0.0.1:8081;
+        return 200 "ok\n";
+    }
+}

@@ -1,0 +1,15 @@
+[Unit]
+Description=NSO project service.py (Flask backend on TCP {{ service_port }})
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt
+ExecStart=/usr/bin/python3 /opt/service.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

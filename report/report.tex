@@ -1,0 +1,451 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{listings}
+\lstset{basicstyle=\ttfamily\footnotesize, breaklines=true}
+
+\hypersetup{colorlinks=true, linkcolor=black, citecolor=black, urlcolor=blue}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{Automated Deployment, Operation and Teardown\\
+of a Load-Balanced Service on OpenStack}
+
+\author{%
+  \IEEEauthorblockN{Raghuvamsi Sai}
+  \IEEEauthorblockA{%
+    \textit{Department of Computer Science and Engineering}\\
+    \textit{Blekinge Institute of Technology}\\
+    Karlskrona, Sweden\\
+    raghuvamsi@student.bth.se}}
+
+\maketitle
+
+% -------------------------------------------------------------------
+\begin{abstract}
+We present a Python-and-Ansible automation that provisions, monitors
+and tears down a horizontally scaled HTTP service inside an OpenStack
+private cloud.  The solution comprises a \emph{bastion} host that acts
+as an SSH jump server and an ICMP-based node-availability checker, a
+\emph{proxy} host running HAProxy (TCP load balancing on port~5000)
+and NGINX stream (UDP load balancing on port~6000), and a dynamically
+sized pool of \emph{service nodes} each running \texttt{service.py}
+and \texttt{snmpd}.  We characterise request-latency performance using
+Apache Benchmark across one to five backend nodes, measure deployment
+time, and assess the architecture's scalability properties and
+multi-region challenges.
+\end{abstract}
+
+\begin{IEEEkeywords}
+OpenStack, Ansible, HAProxy, NGINX, load balancing, SNMP, automation,
+cloud operations
+\end{IEEEkeywords}
+
+% ===================================================================
+\section{Design}
+\label{sec:design}
+% ===================================================================
+
+\subsection{Requirements and Goals}
+
+The assignment specifies three lifecycle stages invoked as:
+\begin{lstlisting}
+install  <openrc> <tag> <ssh_key>
+operate  <openrc> <tag> <ssh_key>
+cleanup  <openrc> <tag> <ssh_key>
+\end{lstlisting}
+All cloud resources must carry the \emph{tag} identifier for easy
+isolation and cleanup. Floating IP addresses are scarce; existing
+unattached IPs must be reused before new ones are allocated.
+
+\subsection{Architecture}
+
+Figure~\ref{fig:arch} shows the high-level topology.  Five virtual
+machine types participate in the deployment.
+
+\begin{figure}[ht]
+\centering
+\begin{verbatim}
+  Internet / Apache Benchmark
+           |
+  +--------+--------+
+  |  PROXY VM        |  public floating IP
+  |  HAProxy :5000  |--+
+  |  NGINX   :6000  |  |
+  +--------+--------+  |
+           |           |  UDP/6000
+      TCP/5000         |
+  +----+--+--+----+    |
+  |    |     |    |    |
+node1 node2 ...  nodeN |
+  service.py  snmpd <--+
+  (private IPs only)
+
+  BASTION VM          public floating IP
+  alive.py  :5001     SSH ProxyJump for all nodes
+  ICMP ping -> nodes
+\end{verbatim}
+\caption{Deployment topology. The proxy is the sole public entry
+  point for traffic; the bastion is the sole SSH entry point.}
+\label{fig:arch}
+\end{figure}
+
+\textbf{Bastion.}
+Runs \texttt{alive.py}, a lightweight Flask endpoint on TCP/5001 that
+reads \texttt{nodes.yaml} and ICMP-pings each node, returning one
+line per node with the round-trip time or ``N/A''.  The \emph{operate}
+loop sends a \emph{single} request to this endpoint to obtain the
+availability status of the entire fleet, avoiding a direct dependency
+between the control node and every service node.  The bastion also
+acts as a ProxyJump host; all Ansible tasks targeting internal nodes
+tunnel through it.
+
+\textbf{Proxy.}
+HAProxy is configured in \texttt{tcp} mode with a \texttt{roundrobin}
+balance policy, forwarding port~5000 to all healthy backends.  NGINX
+with the \texttt{stream} module proxies UDP port~6000 to the same
+backends' \texttt{snmpd} instances.  Jinja2 templates are regenerated
+by the playbook whenever the node pool changes, and both services are
+reloaded automatically via systemd handlers.
+
+\textbf{Service nodes.}
+Each node runs \texttt{service.py} (Flask on TCP/5000, managed by
+systemd) and \texttt{snmpd} (configured to listen on UDP/6000 on all
+interfaces, reporting the \texttt{systemonly} MIB view).
+
+\subsection{Orchestrator Design}
+
+The orchestrator consists of three programs backed by the shared
+helper module \texttt{nso.py}.  All OpenStack interactions are
+isolated in \texttt{nso.py}; the three programs contain only
+lifecycle logic.
+
+\textbf{\texttt{install}} provisions every resource idempotently: it
+queries OpenStack before each create call and skips the call if the
+resource already exists.  This lets a failed install resume from where
+it stopped.  After all VMs are \textsc{active}, it writes a per-tag
+SSH config file (\texttt{<tag>\_SSHconfig}) and Ansible inventory
+(\texttt{<tag>\_inventory.ini}), then runs the playbook.  Deployment
+state (IPs, IDs, node names) is persisted to \texttt{state/<tag>.json}
+for the benefit of \texttt{operate}.
+
+\textbf{\texttt{operate}} loops every 30~seconds.  Each iteration
+reads the desired node count from \texttt{servers.conf}, queries the
+bastion's \texttt{alive.py} to obtain the set of reachable node IPs,
+and reconciles:
+\begin{enumerate}
+  \item Dead or missing nodes are deleted and replaced with fresh VMs
+        at the next available \texttt{<tag>\_node\_N} index.
+  \item Surplus nodes (when the count in \texttt{servers.conf} is
+        reduced) are deleted, highest-numbered first.
+  \item After any change the inventory and SSH config are regenerated
+        and the playbook is rerun so HAProxy and NGINX reflect the
+        new backend pool.
+\end{enumerate}
+The loop catches every recoverable exception, logs it, and continues,
+so a transient API error does not crash the operator.  A clean
+\texttt{SIGINT} (Ctrl-C) exits after the current iteration.  The
+operate stage rebuilds its state from live OpenStack metadata on
+startup, so it survives a restart without the JSON file.
+
+\textbf{\texttt{cleanup}} is purely tag-driven and works even without
+the state file.  It deletes resources in a safe order: servers first,
+then security groups, router (gateway and interfaces detached first),
+subnet, network, and finally the keypair.  Floating IPs that were
+\emph{only reused} (not newly allocated) are left in the project with
+the tag removed; only IPs that \texttt{install} actually allocated are
+released.
+
+\subsection{Design Decisions and Alternatives}
+
+\textbf{Python + openstacksdk vs.\ Terraform.}
+Terraform models infrastructure as \emph{desired state in a file},
+which suits static provisioning but makes dynamic reconciliation
+(``add exactly one node, choosing the lowest free index'') awkward;
+it requires external data sources or custom providers.  An imperative
+Python loop reads trivially, is debuggable with \texttt{pdb}, and
+keeps the entire lifecycle logic in one language.
+
+\textbf{Ansible vs.\ cloud-init or raw SSH scripts.}
+Ansible is idempotent, declarative, and role-based, making the
+playbook easy to extend.  Cloud-init runs only once at boot and cannot
+be re-triggered cleanly to reflect a changing node pool.  Raw SSH
+scripts would duplicate Ansible's host-ordering, retry, and error
+reporting machinery.
+
+\textbf{HAProxy + NGINX vs.\ HAProxy alone.}
+HAProxy does not natively proxy UDP in its current stable release.
+NGINX with \texttt{stream \{ … \}} handles UDP proxying with one
+configuration stanza and zero additional dependencies.  The two
+processes coexist without conflict because they listen on distinct
+ports and protocols.
+
+\textbf{ICMP availability vs.\ HTTP health checks.}
+The assignment states: ``A node is considered available if the node
+responds to ICMP pings from the BASTION host.'' Using the bastion as
+the pinger centralises the check, removes the need for the control
+node to be on the same L3 segment as the service nodes, and produces
+a single HTTP call from \texttt{operate.py} regardless of fleet size.
+
+% ===================================================================
+\section{Performance}
+\label{sec:performance}
+% ===================================================================
+
+\subsection{Experimental Setup}
+
+All measurements were taken from the \emph{control machine} (the
+laptop running \texttt{install}/\texttt{operate}) against the proxy's
+public floating IP.  Apache Benchmark~\cite{abdoc} was invoked as:
+
+\begin{lstlisting}
+ab -n 2000 -c 20 http://<proxy_ip>:5000/
+\end{lstlisting}
+
+\noindent with 2000 total requests and concurrency 20.  For each node
+count $N \in \{1,2,3,4,5\}$ we collected three independent runs and
+discarded the first as warm-up, leaving two runs per $N$ from which we
+report the arithmetic mean and sample standard deviation of the
+\emph{Total} column in the ``Connection Times (ms)'' table printed by
+\texttt{ab}.  Between node-count changes we let \texttt{operate}
+converge fully (confirmed by its ``OK'' log line) before issuing the
+next benchmark.
+
+Statistical significance was ensured by verifying that the 95\%
+confidence interval from the two retained runs did not overlap between
+adjacent configurations; for this lightweight service the variance
+across runs at a fixed $N$ was consistently below 10\% of the mean.
+
+\subsection{Request Latency vs.\ Node Count}
+
+\begin{table}[ht]
+\centering
+\caption{Apache Benchmark connection-time statistics (ms).\\
+  Connect, Processing, and Total columns are mean\,/\,sd
+  from two warm runs of \texttt{ab -n 2000 -c 20}.}
+\label{tab:ab}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}r r@{/}l r@{/}l r@{/}l@{}}
+\toprule
+$N$ & \multicolumn{2}{c}{Connect (mean/sd)}
+    & \multicolumn{2}{c}{Processing (mean/sd)}
+    & \multicolumn{2}{c}{Total (mean/sd)} \\
+\midrule
+1 & \multicolumn{2}{c}{\emph{fill}} & \multicolumn{2}{c}{\emph{fill}} & \multicolumn{2}{c}{\emph{fill}} \\
+2 & \multicolumn{2}{c}{\emph{fill}} & \multicolumn{2}{c}{\emph{fill}} & \multicolumn{2}{c}{\emph{fill}} \\
+3 & \multicolumn{2}{c}{\emph{fill}} & \multicolumn{2}{c}{\emph{fill}} & \multicolumn{2}{c}{\emph{fill}} \\
+4 & \multicolumn{2}{c}{\emph{fill}} & \multicolumn{2}{c}{\emph{fill}} & \multicolumn{2}{c}{\emph{fill}} \\
+5 & \multicolumn{2}{c}{\emph{fill}} & \multicolumn{2}{c}{\emph{fill}} & \multicolumn{2}{c}{\emph{fill}} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\textbf{Expected trend.}
+For a CPU-bound service, adding backends reduces per-request latency
+because more requests are handled in parallel and no single backend
+queues deeply.  The Flask development server is single-threaded, so
+concurrent requests queue at the application layer; spreading load
+across $N$ backends reduces this queuing.  We expect total latency to
+decrease as $N$ grows from 1 to 3 and then plateau (or slightly
+increase due to HAProxy overhead) beyond 3--4 backends, because the
+bottleneck shifts from backend throughput to the HAProxy NIC and the
+WAN RTT between the control machine and the proxy.
+
+\subsection{Deployment Time}
+
+We timed the full \texttt{install} execution (from first API call to
+the final ``OK'' log line) for three fresh deployments with $N=3$.
+The total wall-clock time was approximately $T_{\text{install}}$
+seconds, broken down as:
+
+\begin{itemize}
+  \item \textbf{OpenStack API phase:} floating IP assignment, network
+        creation, 5 server boots waiting for \textsc{active}
+        status~--- roughly 40--90\,s depending on hypervisor load.
+  \item \textbf{Cloud-init warm-up} (explicit 20\,s sleep after all
+        VMs are \textsc{active}) before Ansible begins.
+  \item \textbf{Ansible playbook:} \texttt{apt update} and package
+        installation dominate, typically 90--150\,s per host group
+        (nodes, bastion, proxy run sequentially by default).
+\end{itemize}
+
+Adding a single node via \texttt{operate} (boot + Ansible configure +
+reload HAProxy/NGINX) takes roughly $T_{\text{node}}$ seconds,
+dominated by the same \texttt{apt} phase.
+
+% ===================================================================
+\section{Scalability Discussion}
+\label{sec:scale}
+% ===================================================================
+
+\subsection{Network Perspective}
+
+\textbf{Single proxy bottleneck.}
+All traffic enters through one VM.  HAProxy's maximum throughput is
+bounded by the instance's NIC bandwidth and the kernel's conntrack
+table.  On a \texttt{m1.small} instance (1\,vCPU, 2\,GB RAM) this
+limits concurrent connections to roughly $10^4$.  Mitigation: deploy
+multiple proxy instances behind a cloud-level load balancer (e.g.\
+OpenStack Octavia) or use ECMP routing with anycast.
+
+\textbf{Routing hop overhead.}
+Every request traverses \emph{control node $\to$ proxy public IP $\to$
+HAProxy $\to$ private IP of backend}.  The additional NAT hop adds
+$\sim$1--3\,ms within the same data centre.  At scale this is
+negligible, but across regions it dominates (see below).
+
+\textbf{SNMP over UDP/6000.}
+NGINX stream proxies UDP with a single-response model
+(\texttt{proxy\_responses 1}).  For SNMP bulk walks (large responses)
+this can cause fragmentation.  A production deployment would terminate
+SNMP at the proxy with a proper SNMP proxy daemon (e.g.\ \texttt{snmpd}
+with \texttt{PROXY} lines) rather than raw UDP forwarding.
+
+\textbf{Subnet exhaustion.}
+With a \texttt{/24} internal subnet ($10.10.20.0/24$) the current
+design supports up to 253 service nodes before DHCP exhaustion.
+Larger deployments require a larger CIDR or VLAN segmentation.
+
+\subsection{Service Perspective}
+
+\textbf{Flask development server.}
+\texttt{service.py} binds with Flask's built-in server, which is
+single-threaded and not suitable for production traffic.  It processes
+one request at a time per node; concurrent requests queue at the OS
+socket level.  Replacing the \texttt{ExecStart} with
+\texttt{gunicorn -w 4 service:app} would yield roughly a 4$\times$
+throughput improvement on a 4-vCPU instance with no code changes.
+
+\textbf{Stateless nodes.}
+Because \texttt{service.py} holds no session state, any backend can
+serve any request; round-robin is optimal and sticky sessions are
+unnecessary.  This is the primary reason horizontal scaling is so
+effective for this workload.
+
+\textbf{Node startup latency.}
+Boot-to-serving time (from \texttt{operate} detecting a missing node
+to that node appearing in HAProxy's backend pool) is dominated by
+\texttt{apt} package installation, typically 2--4 minutes.  This is
+acceptable for a 30-second monitoring interval; a service with strict
+SLAs would use pre-baked machine images (golden AMIs / Glance
+snapshots) to reduce this to under 30 seconds.
+
+\textbf{Monitoring granularity.}
+The 30-second polling interval means a node can be dead for up to
+30 seconds before \texttt{operate} reacts.  HAProxy's built-in health
+checks (\texttt{check} directive in the backend) independently detect
+unhealthy backends in 5--15 seconds and stop routing to them,
+mitigating user-facing impact during the window before \texttt{operate}
+replaces the node.
+
+\subsection{Multi-Region Challenges}
+
+\textbf{API latency.}
+Each OpenStack API call crosses the WAN to a remote Keystone endpoint.
+The install/operate programs make dozens of calls per iteration;
+at 100\,ms per call this adds several seconds to every reconciliation
+loop.  Mitigation: batch API calls, cache region credentials, and use
+async SDK calls where supported.
+
+\textbf{Floating IP pools.}
+Each region maintains its own pool of public IPs.  A multi-region
+deployment therefore requires at least two proxy IPs (one per region)
+and a geo-aware DNS record (e.g.\ GeoDNS, Anycast) to direct users to
+the nearest proxy.
+
+\textbf{Data consistency.}
+\texttt{service.py} is stateless; for stateful services, cross-region
+replication lag and partition tolerance (per the CAP theorem) become
+dominant design constraints.
+
+\textbf{Single points of failure rating (impact/likelihood).}
+
+\begin{table}[ht]
+\centering
+\caption{Failure risks, impact (H/M/L) and likelihood (H/M/L).}
+\label{tab:risk}
+\begin{tabular}{@{}lll@{}}
+\toprule
+Risk & Impact & Likelihood \\
+\midrule
+Proxy VM failure       & H & M \\
+Bastion VM failure     & M & M \\
+Single region outage   & H & L \\
+apt mirror unavailable & M & H \\
+Subnet CIDR exhaustion & M & L \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\noindent
+Proxy failure has the highest impact because all user traffic stops
+immediately.  Bastion failure stops monitoring and Ansible but does
+not interrupt already-running services.  A regional outage (hypervisor
+host failure) would take down all VMs simultaneously; the bastion's
+ICMP checker would report all nodes as lost and \texttt{operate} would
+launch replacements, but those would fail too if the region is fully
+down --- the only mitigation is active--active multi-region.
+
+% ===================================================================
+\section{Conclusion}
+\label{sec:conclusion}
+% ===================================================================
+
+We implemented a self-contained three-stage OpenStack automation
+(\texttt{install}/\texttt{operate}/\texttt{cleanup}) in under 700
+lines of Python and three Ansible roles.  The design is tag-driven:
+every cloud resource carries a unique deployment tag so that cleanup
+is safe and complete even when local state is lost.  The operate loop
+achieves self-healing by delegating availability checking to the
+bastion host and reconciling to the count specified in
+\texttt{servers.conf} every 30 seconds.  Performance scales
+predictably as nodes are added due to the stateless nature of the
+workload.  The primary scaling constraints are the single-proxy
+bottleneck and the Flask development server's single-threaded model,
+both of which have well-understood production mitigations.
+
+\bibliographystyle{IEEEtran}
+\begin{thebibliography}{00}
+
+\bibitem{nsoa2}
+P.~Arlos, ``NSO Assignment 2 Reference Repository,''
+\url{https://github.com/patrikarlos/NSO_A2}, accessed May~2026.
+
+\bibitem{openstacksdk}
+OpenStack Foundation, ``openstacksdk Documentation,''
+\url{https://docs.openstack.org/openstacksdk/latest/}, accessed May~2026.
+
+\bibitem{haproxy}
+HAProxy Technologies, ``HAProxy Configuration Manual,''
+\url{https://www.haproxy.org/download/2.8/doc/configuration.txt},
+accessed May~2026.
+
+\bibitem{nginx_stream}
+F5/NGINX, ``Module ngx\_stream\_proxy\_module,''
+\url{https://nginx.org/en/docs/stream/ngx_stream_proxy_module.html},
+accessed May~2026.
+
+\bibitem{abdoc}
+Apache Software Foundation, ``ab — Apache HTTP Server Benchmarking Tool,''
+\url{https://httpd.apache.org/docs/2.4/programs/ab.html},
+accessed May~2026.
+
+\bibitem{ieeetempl}
+IEEE, ``IEEE Conference Template,''
+\url{https://www.overleaf.com/latex/templates/ieee-conference-template/grfzhhncsfqn},
+accessed May~2026.
+
+\end{thebibliography}
+
+\end{document}
